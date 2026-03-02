@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pygame
 
 from netrun_platformer.config import LOGICAL_HEIGHT, LOGICAL_WIDTH, TILE_SIZE
@@ -15,7 +17,9 @@ class LevelRuntime:
         self.player_spawn = (12.0, 12.0)
         self.exit_pos = (self.width * TILE_SIZE - TILE_SIZE * 2, self.height * TILE_SIZE - TILE_SIZE * 3)
         self.enemy_spawns: list[tuple[float, float]] = []
+        self.hunter_spawns: list[tuple[float, float]] = []
         self.turret_spawns: list[tuple[float, float]] = []
+        self.mine_spawns: list[tuple[float, float]] = []
         self.shard_spawns: list[tuple[float, float]] = []
         self.boss_spawn: tuple[float, float] | None = None
 
@@ -32,8 +36,14 @@ class LevelRuntime:
                 elif char == "e":
                     self.enemy_spawns.append((px + 1, py))
                     row[x] = "."
+                elif char == "h":
+                    self.hunter_spawns.append((px + 1, py))
+                    row[x] = "."
                 elif char == "t":
                     self.turret_spawns.append((px + 1, py))
+                    row[x] = "."
+                elif char == "m":
+                    self.mine_spawns.append((px + 2, py + 2))
                     row[x] = "."
                 elif char == "d":
                     self.shard_spawns.append((px + 3, py + 2))
@@ -85,6 +95,21 @@ class LevelRuntime:
                     return True
         return False
 
+    def has_line_of_sight(self, start: tuple[float, float], end: tuple[float, float]) -> bool:
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        distance = math.hypot(dx, dy)
+        if distance <= 1e-6:
+            return True
+        steps = max(1, int(distance / 4.0))
+        for i in range(1, steps):
+            t = i / steps
+            px = start[0] + dx * t
+            py = start[1] + dy * t
+            if self.is_solid_pixel(px, py):
+                return False
+        return True
+
     def draw(self, surface: pygame.Surface, camera_x: int, camera_y: int, pixels: "PixelBankProtocol") -> None:
         start_x = max(0, camera_x // TILE_SIZE)
         end_x = min(self.width, (camera_x + LOGICAL_WIDTH) // TILE_SIZE + 2)
@@ -105,4 +130,3 @@ class LevelRuntime:
 class PixelBankProtocol:
     tile: pygame.Surface
     spike: pygame.Surface
-

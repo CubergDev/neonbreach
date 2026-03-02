@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 from pathlib import Path
 
 import pygame
@@ -19,7 +20,7 @@ from netrun_platformer.config import (
     WINDOW_SCALE,
     WINDOW_WIDTH,
 )
-from netrun_platformer.entities import Boss, Bullet, DataShard, Enemy, Player, Turret
+from netrun_platformer.entities import Boss, Bullet, DataShard, Enemy, Hunter, MineBot, Player, Turret
 from netrun_platformer.levels import LEVELS
 from netrun_platformer.utils import clamp, fmt_time
 from netrun_platformer.world import LevelRuntime
@@ -39,11 +40,14 @@ class Game:
         self.level: LevelRuntime | None = None
         self.player: Player | None = None
         self.enemies: list[Enemy] = []
+        self.hunters: list[Hunter] = []
         self.turrets: list[Turret] = []
+        self.mines: list[MineBot] = []
         self.shards: list[DataShard] = []
         self.boss: Boss | None = None
         self.player_bullets: list[Bullet] = []
         self.enemy_bullets: list[Bullet] = []
+        self.reinforcement_points: list[tuple[float, float]] = []
         self.score = 0
         self.elapsed = 0.0
         self.fade_alpha = 255.0
@@ -51,6 +55,13 @@ class Game:
         self.toast = ""
         self.toast_timer = 0.0
         self.brief_timer = 0.0
+        self.mechanic_timer = 0.0
+        self.mechanic_label = ""
+        self.reinforce_cd = 0.0
+        self.jam_notice_cd = 0.0
+        self.gravity_scale = 1.0
+        self.hazard_damage = 14
+        self.shoot_locked = False
         self.controls = {"left": False, "right": False, "jump": False, "shoot": False, "ability": False}
         self.jump_held = False
         self.pending_mouse_target: tuple[float, float] | None = None
@@ -87,15 +98,25 @@ class Game:
         archetype = ARCHETYPES[self.selected]
         self.player = Player(self.level.player_spawn[0], self.level.player_spawn[1], archetype, self.selected)
         self.enemies = [Enemy(x, y) for x, y in self.level.enemy_spawns]
+        self.hunters = [Hunter(x, y) for x, y in self.level.hunter_spawns]
         self.turrets = [Turret(x, y) for x, y in self.level.turret_spawns]
+        self.mines = [MineBot(x, y) for x, y in self.level.mine_spawns]
         self.shards = [DataShard(x, y) for x, y in self.level.shard_spawns]
         self.boss = Boss(*self.level.boss_spawn) if self.level.boss_spawn else None
         self.player_bullets.clear()
         self.enemy_bullets.clear()
+        self.reinforcement_points = list(self.level.enemy_spawns + self.level.hunter_spawns + self.level.turret_spawns)
         self.level_clear_timer = 0.0
         self.brief_timer = 3.0
         self.toast = self.level.spec.objective
         self.toast_timer = 2.2
+        self.mechanic_timer = 0.0
+        self.mechanic_label = self.level.spec.mechanic_hint
+        self.reinforce_cd = 4.5
+        self.jam_notice_cd = 0.0
+        self.gravity_scale = 1.0
+        self.hazard_damage = 14
+        self.shoot_locked = False
         self.fade_alpha = 255.0
 
     def to_canvas(self, pos: tuple[int, int]) -> tuple[int, int]:
@@ -137,6 +158,8 @@ class Game:
         self.jump_held = jump_down
         if keys[pygame.K_f]:
             self.controls["shoot"] = True
+        if keys[pygame.K_z] or keys[pygame.K_q] or keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]:
+            self.controls["ability"] = True
 
     def _handle_keydown(self, key: int) -> None:
         if self.state == "splash":
@@ -154,7 +177,7 @@ class Game:
         if self.state == "playing":
             if key in (pygame.K_SPACE, pygame.K_w, pygame.K_UP):
                 self.controls["jump"] = True
-            elif key in (pygame.K_q, pygame.K_LSHIFT):
+            elif key in (pygame.K_z, pygame.K_q, pygame.K_LSHIFT, pygame.K_RSHIFT):
                 self.controls["ability"] = True
             elif key == pygame.K_f:
                 self.controls["shoot"] = True
@@ -201,6 +224,70 @@ class Game:
         boss_done = self.boss is None or self.boss.hp <= 0
         return shards_done and boss_done
 
+    def _spawn_reinforcement(self, level: LevelRuntime, player: Player) -> bool:
+        active_count = len(self.enemies) + len(self.hunters) + len(self.turrets) + len(self.mines)
+        if active_count >= 22:
+            return False
+        points = self.reinforcement_points
+        if not points:
+            spawn_x = clamp(player.x + random.choice([-120.0, 120.0]), 6, max(6, level.pixel_width - 24))
+            spawn_y = clamp(player.y - 42.0, 6, max(6, level.pixel_height - 24))
+        else:
+            spawn_x, spawn_y = random.choice(points)
+        player_center_x = player.x + player.w * 0.5
+        player_center_y = player.y + player.h * 0.5
+        if abs(spawn_x - player_center_x) < 28 and abs(spawn_y - player_center_y) < 24:
+            spawn_x = clamp(spawn_x + random.choice([-52.0, 52.0]), 6, max(6, level.pixel_width - 24))
+        roll = random.random()
+        if roll < 0.45:
+            self.enemies.append(Enemy(spawn_x, spawn_y))
+        elif roll < 0.8:
+            self.hunters.append(Hunter(spawn_x, spawn_y))
+        else:
+            self.mines.append(MineBot(spawn_x, spawn_y))
+        return True
+
+    def _update_level_mechanics(self, level: LevelRuntime, player: Player, dt: float) -> None:
+        self.mechanic_timer += dt
+        self.jam_notice_cd = max(0.0, self.jam_notice_cd - dt)
+        self.gravity_scale = 1.0
+        self.hazard_damage = 14
+        self.shoot_locked = False
+        self.mechanic_label = level.spec.mechanic_hint
+        mechanic = level.spec.mechanic
+
+        if mechanic == "thermal_surge":
+            cycle = self.mechanic_timer % 7.2
+            surge_active = cycle >= 4.6
+            if surge_active:
+                self.hazard_damage = 26
+                self.mechanic_label = "thermal surge: traps boosted"
+            else:
+                self.mechanic_label = f"thermal surge in {4.6 - cycle:0.1f}s"
+            return
+
+        if mechanic == "signal_jam":
+            cycle = self.mechanic_timer % 6.0
+            self.shoot_locked = cycle < 2.1
+            self.mechanic_label = "signal jam: uplink blocked" if self.shoot_locked else "signal stable: uplink clear"
+            return
+
+        if mechanic == "drone_wave":
+            self.reinforce_cd = max(0.0, self.reinforce_cd - dt)
+            self.mechanic_label = f"drone wave in {self.reinforce_cd:0.1f}s"
+            if self.reinforce_cd == 0.0:
+                if self._spawn_reinforcement(level, player):
+                    self.toast = "reinforcement drop detected"
+                    self.toast_timer = 1.2
+                self.reinforce_cd = 6.0 + random.random() * 1.5
+            return
+
+        if mechanic == "gravity_flux":
+            cycle = self.mechanic_timer % 6.4
+            heavy = cycle >= 3.2
+            self.gravity_scale = 1.35 if heavy else 0.72
+            self.mechanic_label = "gravity flux: heavy pull" if heavy else "gravity flux: low pull"
+
     def update(self, dt: float) -> None:
         self.fade_alpha = max(0.0, self.fade_alpha - dt * 420.0)
         self.toast_timer = max(0.0, self.toast_timer - dt)
@@ -222,10 +309,11 @@ class Game:
 
         self.elapsed += dt
         self.brief_timer = max(0.0, self.brief_timer - dt)
-        player.update(dt, level, self.controls)
+        self._update_level_mechanics(level, player, dt)
+        player.update(dt, level, self.controls, gravity_scale=self.gravity_scale)
 
         if level.rect_hits_hazard(player.rect):
-            if player.hurt(14):
+            if player.hurt(self.hazard_damage):
                 self.sfx.play("hit")
 
         if self.controls["ability"] and player.ability_timer == player.stats.ability_duration:
@@ -233,7 +321,12 @@ class Game:
         if player.just_jumped:
             self.sfx.play("jump")
 
-        if self.controls["shoot"]:
+        if self.controls["shoot"] and self.shoot_locked:
+            if self.jam_notice_cd == 0.0:
+                self.toast = "signal jam: fire channel blocked"
+                self.toast_timer = 0.6
+                self.jam_notice_cd = 0.6
+        elif self.controls["shoot"]:
             target_world = None
             if self.pending_mouse_target is not None:
                 camera = self.camera()
@@ -244,19 +337,40 @@ class Game:
                 self.sfx.play("shoot")
 
         for enemy in self.enemies:
-            enemy.update(dt, level)
+            enemy.update(dt, level, player, gravity_scale=self.gravity_scale)
             if enemy.rect.colliderect(player.rect) and player.hurt(16):
                 self.sfx.play("hit")
 
+        for hunter in self.hunters:
+            projectile = hunter.update(dt, level, player, gravity_scale=self.gravity_scale)
+            if projectile:
+                self.enemy_bullets.append(projectile)
+            if hunter.rect.colliderect(player.rect) and player.hurt(18):
+                self.sfx.play("hit")
+
+        for mine in list(self.mines):
+            if mine.rect.colliderect(player.rect) and mine.fuse == 0.0:
+                mine.fuse = 0.35
+            exploded = mine.update(dt, level, player, gravity_scale=self.gravity_scale)
+            if exploded:
+                distance = math.hypot(
+                    (mine.x + mine.w * 0.5) - (player.x + player.w * 0.5),
+                    (mine.y + mine.h * 0.5) - (player.y + player.h * 0.5),
+                )
+                if distance <= 28 and player.hurt(26):
+                    self.sfx.play("hit")
+                self.mines.remove(mine)
+                self.sfx.play("boss")
+
         for turret in self.turrets:
-            projectile = turret.update(dt, player)
+            projectile = turret.update(dt, player, level)
             if projectile:
                 self.enemy_bullets.append(projectile)
 
         if self.boss and self.boss.hp > 0:
             if self.boss.rect.colliderect(player.rect) and player.hurt(22):
                 self.sfx.play("hit")
-            self.enemy_bullets.extend(self.boss.update(dt, level, player))
+            self.enemy_bullets.extend(self.boss.update(dt, level, player, gravity_scale=self.gravity_scale))
 
         self._update_player_bullets(level, dt)
         self._update_enemy_bullets(level, player, dt)
@@ -307,6 +421,28 @@ class Game:
                         if turret.hp <= 0:
                             self.turrets.remove(turret)
                             self.add_score(150, "turret")
+                        break
+
+            if not hit:
+                for hunter in list(self.hunters):
+                    if bullet.rect.colliderect(hunter.rect):
+                        hunter.hp -= bullet.damage
+                        hit = True
+                        if hunter.hp <= 0:
+                            self.hunters.remove(hunter)
+                            self.add_score(180, "hunter")
+                        break
+
+            if not hit:
+                for mine in list(self.mines):
+                    if bullet.rect.colliderect(mine.rect):
+                        mine.hp -= bullet.damage
+                        hit = True
+                        if mine.hp <= 0:
+                            self.mines.remove(mine)
+                            self.add_score(110, "mine bot")
+                        else:
+                            mine.fuse = min(mine.fuse if mine.fuse > 0 else 0.4, 0.4)
                         break
 
             if not hit and self.boss and self.boss.hp > 0 and bullet.rect.colliderect(self.boss.rect):
@@ -371,9 +507,17 @@ class Game:
             rect.topleft = pos
         self.canvas.blit(rendered, rect)
 
-    def draw_actor(self, image: pygame.Surface, x: float, y: float, camera: tuple[int, int], facing: int) -> None:
+    def draw_actor(
+        self,
+        image: pygame.Surface,
+        x: float,
+        y: float,
+        camera: tuple[int, int],
+        facing: int,
+        y_offset: int = 0,
+    ) -> None:
         sprite = pygame.transform.flip(image, facing < 0, False)
-        self.canvas.blit(sprite, (int(x) - camera[0], int(y) - camera[1]))
+        self.canvas.blit(sprite, (int(x) - camera[0], int(y) + y_offset - camera[1]))
 
     def draw_play(self) -> None:
         level = self.level
@@ -388,23 +532,61 @@ class Game:
             if shard.taken:
                 continue
             frame = self.pixels.shard_frames[int(self.elapsed * 8) % len(self.pixels.shard_frames)]
-            offset = int(math.sin(self.elapsed * 4.2) * 2)
-            self.canvas.blit(frame, (int(shard.x) - camera[0], int(shard.y) + offset - camera[1]))
+            phase = shard.x * 0.09 + shard.y * 0.07
+            offset = int(math.sin(self.elapsed * 4.2 + phase) * 2)
+            x = int(shard.x) - camera[0]
+            y = int(shard.y) + offset - camera[1]
+            pulse = 0.5 + 0.5 * math.sin(self.elapsed * 6.0 + phase)
+            glow_radius = 8 + int(pulse * 3)
+            glow_alpha = 48 + int(pulse * 82)
+            glow = pygame.Surface((glow_radius * 2, glow_radius * 2), pygame.SRCALPHA)
+            pygame.draw.circle(glow, (74, 240, 226, glow_alpha), (glow_radius, glow_radius), glow_radius)
+            self.canvas.blit(
+                glow,
+                (
+                    x + frame.get_width() // 2 - glow_radius,
+                    y + frame.get_height() // 2 - glow_radius,
+                ),
+            )
+            self.canvas.blit(frame, (x, y))
 
         door_sprite = self.pixels.exit_open if self.exit_ready() else self.pixels.exit_locked
         self.canvas.blit(door_sprite, (level.exit_rect.x - camera[0], level.exit_rect.y - camera[1]))
 
         for enemy in self.enemies:
-            frame = self.pixels.enemy[int(self.elapsed * 8) % 2]
-            self.draw_actor(frame, enemy.x, enemy.y, camera, enemy.facing)
+            phase = enemy.x * 0.06
+            frame = self.pixels.enemy[int(self.elapsed * 8 + phase * 3) % len(self.pixels.enemy)]
+            bob = int(math.sin(self.elapsed * 5.4 + phase) * 1.8)
+            self.draw_actor(frame, enemy.x, enemy.y, camera, enemy.facing, y_offset=bob)
+
+        for hunter in self.hunters:
+            phase = hunter.x * 0.05
+            frame = self.pixels.hunter[int(self.elapsed * 9 + phase * 4) % len(self.pixels.hunter)]
+            bob = int(math.sin(self.elapsed * 6.2 + phase) * 1.4)
+            self.draw_actor(frame, hunter.x, hunter.y, camera, hunter.facing, y_offset=bob)
+
+        for mine in self.mines:
+            frame = self.pixels.mine[int(self.elapsed * 7) % len(self.pixels.mine)]
+            x = int(mine.x) - camera[0]
+            y = int(mine.y) - camera[1]
+            if mine.fuse > 0.0:
+                pulse = 120 + int(abs(math.sin(self.elapsed * 18.0)) * 110)
+                glow = pygame.Surface((20, 20), pygame.SRCALPHA)
+                pygame.draw.circle(glow, (240, 70, 70, pulse), (10, 10), 8)
+                self.canvas.blit(glow, (x - 4, y - 4))
+            self.canvas.blit(frame, (x, y))
 
         for turret in self.turrets:
-            frame = self.pixels.turret[int(self.elapsed * 4) % 2]
-            self.draw_actor(frame, turret.x, turret.y, camera, turret.facing)
+            phase = turret.x * 0.05
+            frame = self.pixels.turret[int(self.elapsed * 5 + phase * 2) % len(self.pixels.turret)]
+            bob = int(math.sin(self.elapsed * 3.0 + phase) * 1.2)
+            self.draw_actor(frame, turret.x, turret.y, camera, turret.facing, y_offset=bob)
 
         if self.boss and self.boss.hp > 0:
-            frame = self.pixels.boss[int(self.elapsed * 4) % 2]
-            self.draw_actor(frame, self.boss.x, self.boss.y, camera, self.boss.facing)
+            phase = self.boss.x * 0.02
+            frame = self.pixels.boss[int(self.elapsed * 4 + phase) % len(self.pixels.boss)]
+            bob = int(math.sin(self.elapsed * 2.2 + phase) * 2.0)
+            self.draw_actor(frame, self.boss.x, self.boss.y, camera, self.boss.facing, y_offset=bob)
 
         for bullet in self.player_bullets:
             self.canvas.blit(self.pixels.bullet_player, (int(bullet.x) - camera[0] - 2, int(bullet.y) - camera[1] - 2))
@@ -414,7 +596,8 @@ class Game:
         anim = player.animation()
         frames = self.pixels.player[player.kind][anim]
         frame = frames[int(self.elapsed * (8 if anim == "run" else 4)) % len(frames)]
-        self.draw_actor(frame, player.x, player.y, camera, player.facing)
+        player_bob = 0 if anim == "jump" else int(math.sin(self.elapsed * 8.5) * 1.0)
+        self.draw_actor(frame, player.x, player.y, camera, player.facing, y_offset=player_bob)
 
         # primitive #1
         hud = pygame.Surface((LOGICAL_WIDTH, 26), pygame.SRCALPHA)
@@ -438,7 +621,15 @@ class Game:
             self.draw_text(f"warden king {self.boss.hp}", self.font_small, COLOR_WARN, (160, 34), align="center")
 
         if player.kind == "ghost" and player.ability_active():
-            self.draw_text("phase dash active", self.font_small, COLOR_NEON, (LOGICAL_WIDTH - 4, 2), align="right")
+            ability_text = "phase dash active"
+        elif player.kind == "bulwark" and player.ability_active():
+            ability_text = "firewall shell active"
+        elif player.ability_cd == 0.0:
+            ability_text = "ability [z] ready"
+        else:
+            ability_text = f"ability [z] cd {player.ability_cd:0.1f}s"
+        self.draw_text(ability_text, self.font_small, COLOR_NEON, (LOGICAL_WIDTH - 4, 2), align="right")
+
         if player.kind == "bulwark" and player.ability_active():
             pygame.draw.circle(
                 self.canvas,
@@ -447,14 +638,17 @@ class Game:
                 12,
                 1,
             )
-            self.draw_text("firewall shell active", self.font_small, COLOR_NEON, (LOGICAL_WIDTH - 4, 2), align="right")
+        if self.mechanic_label:
+            self.draw_text(self.mechanic_label, self.font_small, COLOR_NEON, (LOGICAL_WIDTH - 4, 36), align="right")
 
         if self.brief_timer > 0.0:
-            tip = pygame.Surface((LOGICAL_WIDTH - 20, 30), pygame.SRCALPHA)
+            tip = pygame.Surface((LOGICAL_WIDTH - 20, 38), pygame.SRCALPHA)
             pygame.draw.rect(tip, (8, 12, 20, 220), (0, 0, tip.get_width(), tip.get_height()))
             pygame.draw.rect(tip, (50, 110, 140), (0, 0, tip.get_width(), tip.get_height()), 1)
-            tip.blit(self.font_small.render(level.spec.objective, True, COLOR_WHITE), (8, 9))
-            self.canvas.blit(tip, (10, LOGICAL_HEIGHT - 40))
+            tip.blit(self.font_small.render(level.spec.objective, True, COLOR_WHITE), (8, 6))
+            if level.spec.mechanic_hint:
+                tip.blit(self.font_small.render(level.spec.mechanic_hint, True, COLOR_NEON), (8, 20))
+            self.canvas.blit(tip, (10, LOGICAL_HEIGHT - 48))
 
         if self.toast_timer > 0.0 and self.toast:
             self.draw_text(self.toast, self.font_small, COLOR_NEON, (LOGICAL_WIDTH - 6, 30), align="right")
@@ -480,7 +674,7 @@ class Game:
         pygame.draw.rect(self.canvas, (16, 28, 44), self.menu_start)
         pygame.draw.rect(self.canvas, (66, 180, 200), self.menu_start, 1)
         self.draw_text("start run", self.font_small, COLOR_WHITE, self.menu_start.center, align="center")
-        self.draw_text("1/2 or click to pick, enter/click to start", self.font_small, COLOR_WHITE, (LOGICAL_WIDTH // 2, 170), align="center")
+        self.draw_text("1/2 pick, enter start, z ability", self.font_small, COLOR_WHITE, (LOGICAL_WIDTH // 2, 170), align="center")
 
     def draw_splash(self) -> None:
         self.canvas.blit(self.splash_image, (0, 0))
