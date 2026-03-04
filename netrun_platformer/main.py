@@ -22,18 +22,15 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
     pygame.init()
-    pygame.display.set_caption("neon breach")
-    game = Game(headless=args.headless_smoke)
-    if args.headless_smoke:
-        game.start_run()
-        game.run(fps=FPS, max_frames=150)
-        print("smoke ok")
-    else:
-        game.run(fps=FPS)
-    pygame.quit()
+    try:
+        pygame.display.set_caption("neon breach")
+        game = Game(headless=args.headless_smoke)
+        if args.headless_smoke:
+            game.start_run()
+            game.run(fps=FPS, max_frames=150)
+            print("smoke ok")
+        else:
+            game.run(fps=FPS)
+    finally:
+        pygame.quit()
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-

@@ -80,7 +80,7 @@ class Game:
         self.font_medium = pygame.font.Font(self.font_path, 14)
         self.font_big = pygame.font.Font(self.font_path, 20)
 
-        self.splash_path = Path("assets/images/splash.png")
+        self.splash_path = Path(__file__).resolve().parent / "assets" / "images" / "splash.png"
         ensure_splash_image(self.splash_path)
         self.splash_image = pygame.image.load(self.splash_path).convert()
 
