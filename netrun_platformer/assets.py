@@ -19,6 +19,7 @@ class PixelBank:
         self.bullet_player = self._square(4, (80, 248, 230))
         self.bullet_enemy = self._square(4, (252, 82, 82))
         self.shard_frames = self._make_shard_frames()
+        self.relay = self._build_relay_frames()
         self.player = self._build_player_frames()
         self.enemy = self._build_enemy_frames()
         self.hunter = self._build_hunter_frames()
@@ -194,6 +195,55 @@ class PixelBank:
             "ghost": {"idle": [ghost_idle, ghost_run], "run": [ghost_run, ghost_idle], "jump": [ghost_jump], "ability": [ghost_run]},
             "bulwark": {"idle": [tank_idle, tank_run], "run": [tank_run, tank_idle], "jump": [tank_jump], "ability": [tank_idle]},
         }
+
+    def _build_relay_frames(self) -> list[pygame.Surface]:
+        palette = {"1": (110, 244, 236), "2": (28, 122, 138), "3": (16, 32, 44), "4": (238, 255, 252)}
+        active = self._sprite(
+            [
+                "...33...",
+                "..3223..",
+                ".321123.",
+                ".321123.",
+                "..3223..",
+                "...33...",
+                "..3..3..",
+                "..3..3..",
+                "..3..3..",
+                "..3..3..",
+            ],
+            palette,
+        )
+        charging = self._sprite(
+            [
+                "...33...",
+                "..3443..",
+                ".321123.",
+                ".321123.",
+                "..3443..",
+                "...33...",
+                "..3..3..",
+                ".3....3.",
+                ".3....3.",
+                "..3..3..",
+            ],
+            palette,
+        )
+        broken = self._sprite(
+            [
+                "........",
+                "...33...",
+                "..3..3..",
+                ".3....3.",
+                "..3..3..",
+                "...33...",
+                "..2222..",
+                ".2.22.2.",
+                ".2....2.",
+                "........",
+            ],
+            {"2": (68, 78, 92), "3": (24, 28, 36)},
+        )
+        return [active, charging, active, broken]
 
     def _build_enemy_frames(self) -> list[pygame.Surface]:
         palette = {"1": (255, 120, 120), "2": (134, 42, 58), "3": (44, 16, 24), "4": (255, 214, 214)}

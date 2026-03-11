@@ -16,11 +16,26 @@ from netrun_platformer.config import (
     COLOR_WHITE,
     LOGICAL_HEIGHT,
     LOGICAL_WIDTH,
+    MINEBOT_CONTACT_FUSE,
+    MINEBOT_EXPLOSION_DAMAGE_MAX,
+    MINEBOT_EXPLOSION_DAMAGE_MIN,
+    MINEBOT_EXPLOSION_INNER_RADIUS,
+    MINEBOT_EXPLOSION_RADIUS,
+    MINEBOT_STAGGER_FUSE,
+    SIGNAL_JAM_CYCLE,
+    SIGNAL_JAM_WINDOW,
+    SIGNAL_JAM_WINDOW_REDUCTION,
+    SIGNAL_TIMER_ACTIVE_RELAY_DRAIN,
+    SIGNAL_TIMER_BASE_DRAIN,
+    SIGNAL_TIMER_RECOVERY,
+    SIGNAL_TIMER_RELAY_BONUS,
+    SIGNAL_TIMER_SHARD_BONUS,
+    SIGNAL_TIMER_START,
     WINDOW_HEIGHT,
     WINDOW_SCALE,
     WINDOW_WIDTH,
 )
-from netrun_platformer.entities import Boss, Bullet, DataShard, Enemy, Hunter, MineBot, Player, Turret
+from netrun_platformer.entities import Boss, Bullet, DataShard, Enemy, Hunter, MineBot, Player, RelayNode, Turret
 from netrun_platformer.levels import LEVELS
 from netrun_platformer.utils import clamp, fmt_time
 from netrun_platformer.world import LevelRuntime
@@ -44,6 +59,7 @@ class Game:
         self.turrets: list[Turret] = []
         self.mines: list[MineBot] = []
         self.shards: list[DataShard] = []
+        self.relays: list[RelayNode] = []
         self.boss: Boss | None = None
         self.player_bullets: list[Bullet] = []
         self.enemy_bullets: list[Bullet] = []
@@ -61,7 +77,10 @@ class Game:
         self.jam_notice_cd = 0.0
         self.gravity_scale = 1.0
         self.hazard_damage = 14
+        self.signal_timer = 0.0
+        self.signal_timer_max = 0.0
         self.shoot_locked = False
+        self.end_subtitle = "your signal got burned."
         self.controls = {"left": False, "right": False, "jump": False, "shoot": False, "ability": False}
         self.jump_held = False
         self.pending_mouse_target: tuple[float, float] | None = None
@@ -102,6 +121,7 @@ class Game:
         self.turrets = [Turret(x, y) for x, y in self.level.turret_spawns]
         self.mines = [MineBot(x, y) for x, y in self.level.mine_spawns]
         self.shards = [DataShard(x, y) for x, y in self.level.shard_spawns]
+        self.relays = [RelayNode(x, y) for x, y in self.level.relay_spawns]
         self.boss = Boss(*self.level.boss_spawn) if self.level.boss_spawn else None
         self.player_bullets.clear()
         self.enemy_bullets.clear()
@@ -116,8 +136,11 @@ class Game:
         self.jam_notice_cd = 0.0
         self.gravity_scale = 1.0
         self.hazard_damage = 14
+        self.signal_timer_max = SIGNAL_TIMER_START if self.level.spec.mechanic == "signal_jam" else 0.0
+        self.signal_timer = self.signal_timer_max
         self.shoot_locked = False
         self.fade_alpha = 255.0
+        self.end_subtitle = "your signal got burned."
 
     def to_canvas(self, pos: tuple[int, int]) -> tuple[int, int]:
         if self.headless:
@@ -222,7 +245,8 @@ class Game:
     def exit_ready(self) -> bool:
         shards_done = all(shard.taken for shard in self.shards)
         boss_done = self.boss is None or self.boss.hp <= 0
-        return shards_done and boss_done
+        relays_done = all(relay.disabled for relay in self.relays)
+        return shards_done and boss_done and relays_done
 
     def _spawn_reinforcement(self, level: LevelRuntime, player: Player) -> bool:
         active_count = len(self.enemies) + len(self.hunters) + len(self.turrets) + len(self.mines)
@@ -267,9 +291,20 @@ class Game:
             return
 
         if mechanic == "signal_jam":
-            cycle = self.mechanic_timer % 6.0
-            self.shoot_locked = cycle < 2.1
-            self.mechanic_label = "signal jam: uplink blocked" if self.shoot_locked else "signal stable: uplink clear"
+            active_relays = sum(1 for relay in self.relays if not relay.disabled)
+            if active_relays == 0:
+                self.signal_timer = min(self.signal_timer_max, self.signal_timer + dt * SIGNAL_TIMER_RECOVERY)
+                self.mechanic_label = "signal restored: relays offline"
+                return
+            self.signal_timer = max(
+                0.0,
+                self.signal_timer - dt * (SIGNAL_TIMER_BASE_DRAIN + active_relays * SIGNAL_TIMER_ACTIVE_RELAY_DRAIN),
+            )
+            cycle = self.mechanic_timer % SIGNAL_JAM_CYCLE
+            jam_window = max(0.6, SIGNAL_JAM_WINDOW - (len(self.relays) - active_relays) * SIGNAL_JAM_WINDOW_REDUCTION)
+            self.shoot_locked = cycle < jam_window
+            status = "uplink blocked" if self.shoot_locked else "uplink clear"
+            self.mechanic_label = f"signal jam: {status} | relays {active_relays}/{len(self.relays)}"
             return
 
         if mechanic == "drone_wave":
@@ -310,6 +345,8 @@ class Game:
         self.elapsed += dt
         self.brief_timer = max(0.0, self.brief_timer - dt)
         self._update_level_mechanics(level, player, dt)
+        for relay in self.relays:
+            relay.update(dt)
         player.update(dt, level, self.controls, gravity_scale=self.gravity_scale)
 
         if level.rect_hits_hazard(player.rect):
@@ -350,15 +387,25 @@ class Game:
 
         for mine in list(self.mines):
             if mine.rect.colliderect(player.rect) and mine.fuse == 0.0:
-                mine.fuse = 0.35
+                mine.fuse = MINEBOT_CONTACT_FUSE
             exploded = mine.update(dt, level, player, gravity_scale=self.gravity_scale)
             if exploded:
                 distance = math.hypot(
                     (mine.x + mine.w * 0.5) - (player.x + player.w * 0.5),
                     (mine.y + mine.h * 0.5) - (player.y + player.h * 0.5),
                 )
-                if distance <= 28 and player.hurt(26):
-                    self.sfx.play("hit")
+                if distance <= MINEBOT_EXPLOSION_RADIUS:
+                    if distance <= MINEBOT_EXPLOSION_INNER_RADIUS:
+                        explosion_damage = MINEBOT_EXPLOSION_DAMAGE_MAX
+                    else:
+                        falloff_span = max(1.0, MINEBOT_EXPLOSION_RADIUS - MINEBOT_EXPLOSION_INNER_RADIUS)
+                        t = (distance - MINEBOT_EXPLOSION_INNER_RADIUS) / falloff_span
+                        explosion_damage = int(
+                            MINEBOT_EXPLOSION_DAMAGE_MAX
+                            + (MINEBOT_EXPLOSION_DAMAGE_MIN - MINEBOT_EXPLOSION_DAMAGE_MAX) * t
+                        )
+                    if player.hurt(max(MINEBOT_EXPLOSION_DAMAGE_MIN, explosion_damage)):
+                        self.sfx.play("hit")
                 self.mines.remove(mine)
                 self.sfx.play("boss")
 
@@ -376,7 +423,15 @@ class Game:
         self._update_enemy_bullets(level, player, dt)
         self._collect_shards(player)
 
+        if self.signal_timer_max > 0.0 and self.signal_timer <= 0.0:
+            self.end_subtitle = "the dead channel collapsed your uplink."
+            self.state = "game_over"
+            self.fade_alpha = 255.0
+            self.sfx.play("dead")
+            return
+
         if player.hp <= 0:
+            self.end_subtitle = "your signal got burned."
             self.state = "game_over"
             self.fade_alpha = 255.0
             self.sfx.play("dead")
@@ -397,6 +452,16 @@ class Game:
             self.level_clear_timer = 0.0
 
     def _update_player_bullets(self, level: LevelRuntime, dt: float) -> None:
+        def _stagger_mine(mine: MineBot) -> None:
+            mine.fuse = min(mine.fuse if mine.fuse > 0 else MINEBOT_STAGGER_FUSE, MINEBOT_STAGGER_FUSE)
+
+        target_specs = [
+            (self.enemies, 120, "drone", None),
+            (self.turrets, 150, "turret", None),
+            (self.hunters, 180, "hunter", None),
+            (self.mines, 110, "mine bot", _stagger_mine),
+        ]
+
         for bullet in list(self.player_bullets):
             bullet.update(dt)
             if bullet.ttl <= 0.0 or level.rect_hits_solid(bullet.rect):
@@ -404,46 +469,34 @@ class Game:
                 continue
 
             hit = False
-            for enemy in list(self.enemies):
-                if bullet.rect.colliderect(enemy.rect):
-                    enemy.hp -= bullet.damage
+            for targets, score, label, on_survive in target_specs:
+                for target in list(targets):
+                    if not bullet.rect.colliderect(target.rect):
+                        continue
+                    target.hp -= bullet.damage
                     hit = True
-                    if enemy.hp <= 0:
-                        self.enemies.remove(enemy)
-                        self.add_score(120, "drone")
+                    if target.hp <= 0:
+                        targets.remove(target)
+                        self.add_score(score, label)
+                    elif on_survive is not None:
+                        on_survive(target)
+                    break
+                if hit:
                     break
 
             if not hit:
-                for turret in list(self.turrets):
-                    if bullet.rect.colliderect(turret.rect):
-                        turret.hp -= bullet.damage
-                        hit = True
-                        if turret.hp <= 0:
-                            self.turrets.remove(turret)
-                            self.add_score(150, "turret")
-                        break
-
-            if not hit:
-                for hunter in list(self.hunters):
-                    if bullet.rect.colliderect(hunter.rect):
-                        hunter.hp -= bullet.damage
-                        hit = True
-                        if hunter.hp <= 0:
-                            self.hunters.remove(hunter)
-                            self.add_score(180, "hunter")
-                        break
-
-            if not hit:
-                for mine in list(self.mines):
-                    if bullet.rect.colliderect(mine.rect):
-                        mine.hp -= bullet.damage
-                        hit = True
-                        if mine.hp <= 0:
-                            self.mines.remove(mine)
-                            self.add_score(110, "mine bot")
-                        else:
-                            mine.fuse = min(mine.fuse if mine.fuse > 0 else 0.4, 0.4)
-                        break
+                for relay in self.relays:
+                    if relay.disabled or not bullet.rect.colliderect(relay.rect):
+                        continue
+                    relay.hurt(bullet.damage)
+                    hit = True
+                    if relay.disabled:
+                        self.add_score(220, "relay")
+                        self.signal_timer = min(self.signal_timer_max, self.signal_timer + SIGNAL_TIMER_RELAY_BONUS)
+                        if all(node.disabled for node in self.relays):
+                            self.toast = "relay network offline"
+                            self.toast_timer = 1.6
+                    break
 
             if not hit and self.boss and self.boss.hp > 0 and bullet.rect.colliderect(self.boss.rect):
                 self.boss.hp -= bullet.damage
@@ -472,6 +525,8 @@ class Game:
             if not shard.taken and player.rect.colliderect(shard.rect):
                 shard.taken = True
                 self.add_score(250, "shard")
+                if self.signal_timer_max > 0.0:
+                    self.signal_timer = min(self.signal_timer_max, self.signal_timer + SIGNAL_TIMER_SHARD_BONUS)
                 self.sfx.play("pickup")
 
     def camera(self) -> tuple[int, int]:
@@ -553,6 +608,20 @@ class Game:
         door_sprite = self.pixels.exit_open if self.exit_ready() else self.pixels.exit_locked
         self.canvas.blit(door_sprite, (level.exit_rect.x - camera[0], level.exit_rect.y - camera[1]))
 
+        for relay in self.relays:
+            x = int(relay.x) - camera[0]
+            y = int(relay.y) - camera[1]
+            if relay.disabled:
+                frame = self.pixels.relay[-1]
+            else:
+                frame = self.pixels.relay[int(relay.pulse * 6.0) % (len(self.pixels.relay) - 1)]
+                glow_radius = 10 + int((math.sin(relay.pulse * 7.0) * 0.5 + 0.5) * 4)
+                glow_alpha = 42 + int((math.sin(relay.pulse * 9.0) * 0.5 + 0.5) * 56)
+                glow = pygame.Surface((glow_radius * 2, glow_radius * 2), pygame.SRCALPHA)
+                pygame.draw.circle(glow, (72, 232, 226, glow_alpha), (glow_radius, glow_radius), glow_radius)
+                self.canvas.blit(glow, (x + frame.get_width() // 2 - glow_radius, y + 6 - glow_radius))
+            self.canvas.blit(frame, (x, y))
+
         for enemy in self.enemies:
             phase = enemy.x * 0.06
             frame = self.pixels.enemy[int(self.elapsed * 8 + phase * 3) % len(self.pixels.enemy)]
@@ -614,11 +683,17 @@ class Game:
         self.draw_text(level.spec.name, self.font_small, COLOR_WHITE, (4, 2))
         self.draw_text(hp_text, self.font_small, COLOR_WHITE, (4, 13))
         self.draw_text(score_text, self.font_small, COLOR_WHITE, (98, 13))
+        if self.signal_timer_max > 0.0:
+            time_text = f"signal {self.signal_timer:0.1f}s"
         self.draw_text(time_text, self.font_small, COLOR_WHITE, (170, 13))
         self.draw_text(shard_text, self.font_small, COLOR_WHITE, (244, 13))
 
         if self.boss and self.boss.hp > 0:
             self.draw_text(f"warden king {self.boss.hp}", self.font_small, COLOR_WARN, (160, 34), align="center")
+        elif self.relays:
+            down_count = sum(1 for relay in self.relays if relay.disabled)
+            self.draw_text(f"relays {down_count}/{len(self.relays)}", self.font_small, COLOR_WARN, (160, 34),
+                           align="center")
 
         if player.kind == "ghost" and player.ability_active():
             ability_text = "phase dash active"
@@ -700,7 +775,7 @@ class Game:
         elif self.state == "playing":
             self.draw_play()
         elif self.state == "game_over":
-            self.draw_end("game over", "your signal got burned.")
+            self.draw_end("game over", self.end_subtitle)
         elif self.state == "victory":
             self.draw_end("city unlocked", "root key extracted. null sector is offline.")
 

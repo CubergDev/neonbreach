@@ -6,7 +6,53 @@ from dataclasses import dataclass
 
 import pygame
 
-from netrun_platformer.config import GRAVITY, MAX_FALL_SPEED
+from netrun_platformer.config import (
+    BOSS_BULLET_DAMAGE,
+    ENEMY_AGGRO_ENTER_RANGE,
+    ENEMY_AGGRO_EXIT_RANGE,
+    ENEMY_CHASE_MAX_DY,
+    ENEMY_CHASE_MEMORY,
+    ENEMY_AGGRO_RANGE,
+    ENEMY_BASE_SPEED,
+    ENEMY_EDGE_FAIL_TURN_TIME,
+    ENEMY_EDGE_COMMIT_DY,
+    ENEMY_EDGE_DROP_DY,
+    ENEMY_EDGE_HOLD_TIME,
+    ENEMY_GAP_JUMP_PIXELS,
+    ENEMY_JUMP_COOLDOWN,
+    ENEMY_JUMP_POWER,
+    ENEMY_PATROL_SPEED_FACTOR,
+    ENEMY_ROAM_GAP_COOLDOWN,
+    ENEMY_STUCK_TIME,
+    ENEMY_TURN_COOLDOWN,
+    GRAVITY,
+    HUNTER_BULLET_DAMAGE,
+    HUNTER_AGGRO_RANGE,
+    HUNTER_BASE_SPEED,
+    HUNTER_FIRE_COOLDOWN_MAX,
+    HUNTER_FIRE_COOLDOWN_MIN,
+    HUNTER_JUMP_POWER,
+    HUNTER_PATROL_SPEED_FACTOR,
+    HUNTER_PREFERRED_MAX_X,
+    HUNTER_PREFERRED_MIN_X,
+    MINEBOT_AGGRO_RANGE,
+    MINEBOT_ARM_RANGE_X,
+    MINEBOT_ARM_RANGE_Y,
+    MINEBOT_FUSE_CHASE_SPEED,
+    MINEBOT_FUSE_TIME,
+    MINEBOT_JUMP_COOLDOWN,
+    MINEBOT_JUMP_POWER,
+    MINEBOT_MIN_FUSE_NEAR_TARGET,
+    MINEBOT_PATROL_SPEED_FACTOR,
+    MINEBOT_SPEED,
+    MINEBOT_STUCK_TIME,
+    MAX_FALL_SPEED,
+    TILE_SIZE,
+    HUNTER_SHOOT_RANGE_X,
+    HUNTER_SHOOT_RANGE_Y,
+    TURRET_BULLET_DAMAGE,
+    RELAY_MAX_HP,
+)
 
 
 @dataclass
@@ -38,6 +84,30 @@ class DataShard:
     @property
     def rect(self) -> pygame.Rect:
         return pygame.Rect(int(self.x), int(self.y), 10, 12)
+
+
+@dataclass
+class RelayNode:
+    x: float
+    y: float
+    hp: int = RELAY_MAX_HP
+    disabled: bool = False
+    pulse: float = 0.0
+
+    @property
+    def rect(self) -> pygame.Rect:
+        return pygame.Rect(int(self.x), int(self.y), 14, 20)
+
+    def update(self, dt: float) -> None:
+        self.pulse += dt
+
+    def hurt(self, damage: int) -> bool:
+        if self.disabled:
+            return False
+        self.hp = max(0, self.hp - damage)
+        if self.hp == 0:
+            self.disabled = True
+        return True
 
 
 class PhysicsBody:
@@ -100,6 +170,34 @@ class PhysicsBody:
             else:
                 self.y += step
             move -= step
+
+    def _blocked_ahead(self, level: "LevelRuntimeProtocol", direction: int) -> bool:
+        check_x = self.rect.right + 1 if direction > 0 else self.rect.left - 1
+        return level.is_solid_pixel(check_x, self.y + 2) or level.is_solid_pixel(check_x, self.y + self.h - 2)
+
+    def _floor_ahead(self, level: "LevelRuntimeProtocol", direction: int) -> bool:
+        foot_x = self.rect.right + 1 if direction > 0 else self.rect.left - 1
+        foot_y = self.y + self.h + 1
+        return level.is_solid_pixel(foot_x, foot_y)
+
+    def _ahead_x(self, direction: int, offset: int = 1) -> float:
+        return self.rect.right + offset if direction > 0 else self.rect.left - offset
+
+    def _has_headroom_to_jump(self, level: "LevelRuntimeProtocol", direction: int) -> bool:
+        sample_y = self.y - 2
+        for offset in (3, 7, 11):
+            if level.is_solid_pixel(self._ahead_x(direction, offset), sample_y):
+                return False
+        return True
+
+    def _has_landing_ahead(self, level: "LevelRuntimeProtocol", direction: int, max_forward: int) -> bool:
+        step = max(6, TILE_SIZE // 2)
+        for forward in range(step, max_forward + step, step):
+            sample_x = self._ahead_x(direction, 0) + direction * forward
+            for drop in (0, 8, 16, 24, 32, 40, 48):
+                if level.is_solid_pixel(sample_x, self.y + self.h + 1 + drop):
+                    return True
+        return False
 
 
 class Player(PhysicsBody):
@@ -202,18 +300,27 @@ class Enemy(PhysicsBody):
     def __init__(self, x: float, y: float) -> None:
         super().__init__(x, y, 14, 16, 56)
         self.direction = random.choice([-1, 1])
-        self.speed = 58.0
-        self.aggro_range = 280.0
-        self.jump_power = 280.0
+        self.speed = ENEMY_BASE_SPEED
+        self.patrol_speed_factor = ENEMY_PATROL_SPEED_FACTOR
+        self.aggro_range = ENEMY_AGGRO_RANGE
+        self.jump_power = ENEMY_JUMP_POWER
+        self.jump_cd = random.uniform(0.05, ENEMY_JUMP_COOLDOWN)
+        self.stuck_timer = 0.0
+        self.reposition_timer = 0.0
+        self.edge_hold_timer = 0.0
+        self.edge_fail_timer = 0.0
+        self.turn_cd = 0.0
+        self.roam_gap_cd = random.uniform(0.1, ENEMY_ROAM_GAP_COOLDOWN)
+        self.chase_memory = 0.0
 
-    def _blocked_ahead(self, level: "LevelRuntimeProtocol", direction: int) -> bool:
-        check_x = self.rect.right + 1 if direction > 0 else self.rect.left - 1
-        return level.is_solid_pixel(check_x, self.y + 2) or level.is_solid_pixel(check_x, self.y + self.h - 2)
-
-    def _floor_ahead(self, level: "LevelRuntimeProtocol", direction: int) -> bool:
-        foot_x = self.rect.right + 1 if direction > 0 else self.rect.left - 1
-        foot_y = self.y + self.h + 1
-        return level.is_solid_pixel(foot_x, foot_y)
+    def _preferred_direction(
+            self,
+            level: "LevelRuntimeProtocol",
+            player: "Player",
+            dx: float,
+            dy: float,
+    ) -> int | None:
+        return None
 
     def update(
         self,
@@ -222,22 +329,130 @@ class Enemy(PhysicsBody):
         player: "Player",
         gravity_scale: float = 1.0,
     ) -> None:
+        self.jump_cd = max(0.0, self.jump_cd - dt)
+        self.reposition_timer = max(0.0, self.reposition_timer - dt)
+        self.edge_hold_timer = max(0.0, self.edge_hold_timer - dt)
+        self.edge_fail_timer = max(0.0, self.edge_fail_timer - dt)
+        self.turn_cd = max(0.0, self.turn_cd - dt)
+        self.roam_gap_cd = max(0.0, self.roam_gap_cd - dt)
+        self.chase_memory = max(0.0, self.chase_memory - dt)
+
         player_center_x = player.x + player.w * 0.5
+        player_center_y = player.y + player.h * 0.5
         my_center_x = self.x + self.w * 0.5
+        my_center_y = self.y + self.h * 0.5
         dx = player_center_x - my_center_x
-        if abs(dx) <= self.aggro_range:
-            if abs(dx) > 2.0:
-                self.direction = 1 if dx > 0 else -1
-        if self.on_ground and self._blocked_ahead(level, self.direction):
+        dy = player_center_y - my_center_y
+        los = level.has_line_of_sight((my_center_x, my_center_y), (player_center_x, player_center_y))
+        if abs(dx) <= ENEMY_AGGRO_ENTER_RANGE and abs(dy) <= ENEMY_CHASE_MAX_DY and (los or abs(dy) <= TILE_SIZE):
+            self.chase_memory = ENEMY_CHASE_MEMORY
+        elif los and abs(dx) <= ENEMY_AGGRO_EXIT_RANGE and abs(dy) <= ENEMY_CHASE_MAX_DY * 1.2:
+            self.chase_memory = max(self.chase_memory, ENEMY_CHASE_MEMORY * 0.65)
+        elif abs(dx) > ENEMY_AGGRO_EXIT_RANGE * 1.25:
+            self.chase_memory = 0.0
+
+        chasing = self.chase_memory > 0.0 and abs(dx) <= self.aggro_range
+        hold_position = False
+
+        preferred_direction = self._preferred_direction(level, player, dx, dy)
+        if preferred_direction is not None:
+            if preferred_direction == 0:
+                hold_position = True
+                desired_direction = self.direction
+            else:
+                desired_direction = preferred_direction
+        else:
+            desired_direction = 1 if dx > 0 else -1
+
+        if chasing and abs(dx) > 2.0 and not hold_position:
+            if desired_direction != self.direction:
+                if self.turn_cd == 0.0 or not self.on_ground:
+                    self.direction = desired_direction
+                    self.turn_cd = ENEMY_TURN_COOLDOWN
+
+        blocked = self._blocked_ahead(level, self.direction)
+        floor_ahead = self._floor_ahead(level, self.direction)
+        player_above = dy < -8.0
+        player_ahead = dx * self.direction > 0.0
+        near_player = abs(dx) <= TILE_SIZE * 6
+
+        should_jump = False
+        if self.on_ground and self.jump_cd == 0.0:
+            if blocked and self._has_headroom_to_jump(level, self.direction):
+                should_jump = True
+            elif (
+                    chasing
+                    and player_ahead
+                    and not floor_ahead
+                    and dy < TILE_SIZE * 2
+                    and self._has_headroom_to_jump(level, self.direction)
+                    and self._has_landing_ahead(level, self.direction, int(ENEMY_GAP_JUMP_PIXELS))
+            ):
+                should_jump = True
+            elif (
+                    chasing
+                    and player_above
+                    and near_player
+                    and (blocked or self.reposition_timer == 0.0)
+                    and self._has_headroom_to_jump(level, self.direction)
+            ):
+                should_jump = True
+
+        if should_jump:
             self.vy = -self.jump_power
-        elif self.on_ground and not self._floor_ahead(level, self.direction):
-            self.direction *= -1
-        self.vx = self.direction * self.speed
+            self.jump_cd = ENEMY_JUMP_COOLDOWN
+            self.reposition_timer = 0.32
+            self.edge_hold_timer = 0.0
+            self.edge_fail_timer = 0.0
+        elif self.on_ground and not floor_ahead:
+            safe_drop_or_jump = self._has_landing_ahead(level, self.direction, int(ENEMY_GAP_JUMP_PIXELS))
+            if not chasing:
+                if safe_drop_or_jump and self.roam_gap_cd == 0.0:
+                    self.edge_hold_timer = 0.0
+                    self.roam_gap_cd = ENEMY_ROAM_GAP_COOLDOWN
+                    self.edge_fail_timer = 0.0
+                else:
+                    self.direction *= -1
+                    self.turn_cd = ENEMY_TURN_COOLDOWN
+                    self.edge_fail_timer = 0.0
+            else:
+                if safe_drop_or_jump and (player_ahead or dy >= ENEMY_EDGE_COMMIT_DY):
+                    self.edge_hold_timer = 0.0
+                    self.roam_gap_cd = ENEMY_ROAM_GAP_COOLDOWN
+                    self.edge_fail_timer = 0.0
+                else:
+                    self.edge_hold_timer = ENEMY_EDGE_HOLD_TIME
+                    self.edge_fail_timer += dt
+                    if self.edge_fail_timer >= ENEMY_EDGE_FAIL_TURN_TIME:
+                        self.direction *= -1
+                        self.turn_cd = ENEMY_TURN_COOLDOWN
+                        self.edge_fail_timer = 0.0
+                        self.edge_hold_timer = 0.0
+
+        patrol_speed = self.speed * self.patrol_speed_factor
+        move_speed = self.speed if chasing else patrol_speed
+        self.vx = 0.0 if self.edge_hold_timer > 0.0 or hold_position else self.direction * move_speed
         self.vy = min(MAX_FALL_SPEED, self.vy + GRAVITY * gravity_scale * dt)
+
         prev_x = self.x
         self.move(level, dt)
-        if self.on_ground and abs(self.x - prev_x) < 0.05 and self._blocked_ahead(level, self.direction):
-            self.direction *= -1
+        moved = abs(self.x - prev_x)
+        if self.on_ground and abs(self.vx) > 0.1 and moved < 0.08:
+            self.stuck_timer += dt
+        else:
+            self.stuck_timer = max(0.0, self.stuck_timer - dt * 0.5)
+
+        if self.on_ground and self.stuck_timer >= ENEMY_STUCK_TIME:
+            if self.jump_cd == 0.0 and self._has_headroom_to_jump(level, self.direction):
+                self.vy = -self.jump_power
+                self.jump_cd = ENEMY_JUMP_COOLDOWN
+            else:
+                self.direction *= -1
+                self.turn_cd = ENEMY_TURN_COOLDOWN
+            self.stuck_timer = 0.0
+            self.reposition_timer = 0.25
+            self.edge_hold_timer = 0.0
+
         self.facing = self.direction
 
 
@@ -246,9 +461,28 @@ class Hunter(Enemy):
         super().__init__(x, y)
         self.hp = 68
         self.max_hp = 68
-        self.speed = 70.0
-        self.aggro_range = 340.0
-        self.shot_cd = random.uniform(0.2, 1.0)
+        self.speed = HUNTER_BASE_SPEED
+        self.patrol_speed_factor = HUNTER_PATROL_SPEED_FACTOR
+        self.aggro_range = HUNTER_AGGRO_RANGE
+        self.jump_power = HUNTER_JUMP_POWER
+        self.shot_cd = random.uniform(0.2, 0.9)
+
+    def _preferred_direction(
+            self,
+            level: "LevelRuntimeProtocol",
+            player: "Player",
+            dx: float,
+            dy: float,
+    ) -> int | None:
+        origin = (self.x + self.w * 0.5, self.y + self.h * 0.42)
+        target = (player.x + player.w * 0.5, player.y + player.h * 0.5)
+        if not level.has_line_of_sight(origin, target):
+            return None
+        if abs(dx) < HUNTER_PREFERRED_MIN_X:
+            return -1 if dx > 0 else 1
+        if abs(dx) > HUNTER_PREFERRED_MAX_X:
+            return 1 if dx > 0 else -1
+        return 0
 
     def update(
         self,
@@ -265,33 +499,28 @@ class Hunter(Enemy):
         target_y = player.y + player.h * 0.5
         dx = target_x - origin_x
         dy = target_y - origin_y
-        if abs(dx) > 190 or abs(dy) > 96:
+        if abs(dx) > HUNTER_SHOOT_RANGE_X or abs(dy) > HUNTER_SHOOT_RANGE_Y:
             return None
         if self.shot_cd > 0.0:
             return None
         if not level.has_line_of_sight((origin_x, origin_y), (target_x, target_y)):
             return None
-        self.shot_cd = random.uniform(1.0, 1.6)
+        self.shot_cd = random.uniform(HUNTER_FIRE_COOLDOWN_MIN, HUNTER_FIRE_COOLDOWN_MAX)
         length = max(1.0, math.hypot(dx, dy))
         speed = 208.0
-        return Bullet(origin_x, origin_y, dx / length * speed, dy / length * speed, 12, False)
+        return Bullet(origin_x, origin_y, dx / length * speed, dy / length * speed, HUNTER_BULLET_DAMAGE, False)
 
 
 class MineBot(PhysicsBody):
     def __init__(self, x: float, y: float) -> None:
         super().__init__(x, y, 12, 12, 34)
         self.direction = random.choice([-1, 1])
-        self.speed = 76.0
+        self.speed = MINEBOT_SPEED
         self.fuse = 0.0
-
-    def _blocked_ahead(self, level: "LevelRuntimeProtocol", direction: int) -> bool:
-        check_x = self.rect.right + 1 if direction > 0 else self.rect.left - 1
-        return level.is_solid_pixel(check_x, self.y + 2) or level.is_solid_pixel(check_x, self.y + self.h - 2)
-
-    def _floor_ahead(self, level: "LevelRuntimeProtocol", direction: int) -> bool:
-        foot_x = self.rect.right + 1 if direction > 0 else self.rect.left - 1
-        foot_y = self.y + self.h + 1
-        return level.is_solid_pixel(foot_x, foot_y)
+        self.aggro_range = MINEBOT_AGGRO_RANGE
+        self.jump_power = MINEBOT_JUMP_POWER
+        self.jump_cd = random.uniform(0.05, MINEBOT_JUMP_COOLDOWN)
+        self.stuck_timer = 0.0
 
     def update(
         self,
@@ -300,38 +529,71 @@ class MineBot(PhysicsBody):
         player: "Player",
         gravity_scale: float = 1.0,
     ) -> bool:
+        self.jump_cd = max(0.0, self.jump_cd - dt)
         player_center_x = player.x + player.w * 0.5
         player_center_y = player.y + player.h * 0.5
         my_center_x = self.x + self.w * 0.5
         my_center_y = self.y + self.h * 0.5
         dx = player_center_x - my_center_x
         dy = player_center_y - my_center_y
+        los_to_player = level.has_line_of_sight((my_center_x, my_center_y), (player_center_x, player_center_y))
 
         if self.fuse > 0.0:
             self.fuse = max(0.0, self.fuse - dt)
-            self.vx = 0.0
+            if abs(dx) > 1.5:
+                self.direction = 1 if dx > 0 else -1
+            self.vx = self.direction * MINEBOT_FUSE_CHASE_SPEED
+            if self.on_ground and self.jump_cd == 0.0 and self._blocked_ahead(level,
+                                                                              self.direction) and self._has_headroom_to_jump(
+                    level, self.direction):
+                self.vy = -self.jump_power * 0.9
+                self.jump_cd = MINEBOT_JUMP_COOLDOWN * 0.8
+            elif self.on_ground and not self._floor_ahead(level, self.direction):
+                safe_drop = self._has_landing_ahead(level, self.direction, int(ENEMY_GAP_JUMP_PIXELS))
+                if not safe_drop and abs(dy) <= ENEMY_EDGE_COMMIT_DY:
+                    self.direction *= -1
             self.vy = min(MAX_FALL_SPEED, self.vy + GRAVITY * gravity_scale * dt)
             self.move(level, dt)
+            if abs(dx) <= MINEBOT_ARM_RANGE_X * 0.6 and abs(dy) <= MINEBOT_ARM_RANGE_Y * 0.75 and los_to_player:
+                self.fuse = min(self.fuse, MINEBOT_MIN_FUSE_NEAR_TARGET)
             return self.fuse == 0.0
 
-        if abs(dx) <= 160 and abs(dy) <= 56 and abs(dx) > 1.5:
+        chasing = abs(dx) <= self.aggro_range and abs(dy) <= TILE_SIZE * 5
+        if chasing and abs(dx) > 1.5:
             self.direction = 1 if dx > 0 else -1
-        if abs(dx) <= 22 and abs(dy) <= 20:
-            self.fuse = 0.55
+        if abs(dx) <= MINEBOT_ARM_RANGE_X and abs(dy) <= MINEBOT_ARM_RANGE_Y and los_to_player:
+            self.fuse = MINEBOT_FUSE_TIME
             self.vx = 0.0
             return False
 
-        if self.on_ground and self._blocked_ahead(level, self.direction):
-            self.vy = -220.0
+        if self.on_ground and self.jump_cd == 0.0 and self._blocked_ahead(level,
+                                                                          self.direction) and self._has_headroom_to_jump(
+                level, self.direction):
+            self.vy = -self.jump_power
+            self.jump_cd = MINEBOT_JUMP_COOLDOWN
         elif self.on_ground and not self._floor_ahead(level, self.direction):
-            self.direction *= -1
+            player_far_below = dy >= ENEMY_EDGE_DROP_DY
+            safe_drop = self._has_landing_ahead(level, self.direction, int(ENEMY_GAP_JUMP_PIXELS))
+            if not chasing or (not player_far_below and not safe_drop):
+                self.direction *= -1
 
-        self.vx = self.direction * self.speed
+        move_speed = self.speed if chasing else self.speed * MINEBOT_PATROL_SPEED_FACTOR
+        self.vx = self.direction * move_speed
         self.vy = min(MAX_FALL_SPEED, self.vy + GRAVITY * gravity_scale * dt)
         prev_x = self.x
         self.move(level, dt)
-        if self.on_ground and abs(self.x - prev_x) < 0.05 and self._blocked_ahead(level, self.direction):
-            self.direction *= -1
+        moved = abs(self.x - prev_x)
+        if self.on_ground and abs(self.vx) > 0.1 and moved < 0.06:
+            self.stuck_timer += dt
+        else:
+            self.stuck_timer = max(0.0, self.stuck_timer - dt * 0.5)
+        if self.on_ground and self.stuck_timer >= MINEBOT_STUCK_TIME:
+            if self.jump_cd == 0.0 and self._has_headroom_to_jump(level, self.direction):
+                self.vy = -self.jump_power
+                self.jump_cd = MINEBOT_JUMP_COOLDOWN
+            else:
+                self.direction *= -1
+            self.stuck_timer = 0.0
         self.facing = self.direction
         return False
 
@@ -359,7 +621,7 @@ class Turret(PhysicsBody):
         self.cooldown = 1.25
         speed = 180.0
         length = max(1.0, math.hypot(dx, dy))
-        return Bullet(origin_x, origin_y, dx / length * speed, dy / length * speed, 14, False)
+        return Bullet(origin_x, origin_y, dx / length * speed, dy / length * speed, TURRET_BULLET_DAMAGE, False)
 
 
 class Boss(PhysicsBody):
@@ -402,7 +664,10 @@ class Boss(PhysicsBody):
             towards = math.atan2(target_y - origin_y, target_x - origin_x)
             for spread in (-0.16, 0.0, 0.16):
                 angle = towards + spread
-                bullets.append(Bullet(origin_x, origin_y, math.cos(angle) * 210.0, math.sin(angle) * 210.0, 18, False))
+                bullets.append(
+                    Bullet(origin_x, origin_y, math.cos(angle) * 210.0, math.sin(angle) * 210.0, BOSS_BULLET_DAMAGE,
+                           False)
+                )
         return bullets
 
 

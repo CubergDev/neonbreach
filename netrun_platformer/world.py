@@ -21,6 +21,7 @@ class LevelRuntime:
         self.turret_spawns: list[tuple[float, float]] = []
         self.mine_spawns: list[tuple[float, float]] = []
         self.shard_spawns: list[tuple[float, float]] = []
+        self.relay_spawns: list[tuple[float, float]] = []
         self.boss_spawn: tuple[float, float] | None = None
 
         for y, row in enumerate(grid):
@@ -47,6 +48,9 @@ class LevelRuntime:
                     row[x] = "."
                 elif char == "d":
                     self.shard_spawns.append((px + 3, py + 2))
+                    row[x] = "."
+                elif char == "r":
+                    self.relay_spawns.append((px + 1, py - 4))
                     row[x] = "."
                 elif char == "b":
                     self.boss_spawn = (px, py - 10)
